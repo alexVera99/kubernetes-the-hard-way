@@ -15,14 +15,16 @@
 # Setup steps:
 #   1. Download the Debian 12 genericcloud AMD64 image (one-time, ~300MB)
 #   2. Create a libvirt NAT network (k8s-hardway, 192.168.100.0/24)
-#   3. For each VM: create a thin-provisioned overlay disk, a cloud-init seed
-#      ISO with static IP + root SSH key injected, then launch with virt-install
+#   3. For each VM: create a thin-provisioned overlay disk, configure it
+#      directly with virt-customize (password, SSH key, static IP, hostname),
+#      then launch with virt-install
 #   4. Test SSH connectivity after boot
 #
 # Requires: virsh, virt-install, qemu-img, cloud-localds (cloud-image-utils)
 set -euo pipefail
 
 IMAGES_DIR="$(cd "$(dirname "$0")" && pwd)"
+VM_PASSWORD="${VM_PASSWORD:-k8s-hardway}"
 SSH_PUB_KEY_PATH="${SSH_PUB_KEY_PATH:-$HOME/.ssh/id_ed25519.pub}"
 if [[ ! -f "$SSH_PUB_KEY_PATH" ]]; then
   echo "ERROR: SSH public key not found at '$SSH_PUB_KEY_PATH'" >&2
@@ -63,14 +65,10 @@ cmd_cleanup() {
   done
 
   echo ""
-  echo "==> Removing disk images, seed ISOs, and cloud-init dirs..."
+  echo "==> Removing disk images..."
   for VM in "${VMS[@]}"; do
     local disk="$IMAGES_DIR/${VM}.qcow2"
-    local seed="$IMAGES_DIR/${VM}-seed.iso"
-    local cidir="$IMAGES_DIR/cloud-init-${VM}"
-    [[ -f "$disk"  ]] && rm -f  "$disk"  && echo "    Deleted ${VM}.qcow2"       || true
-    [[ -f "$seed"  ]] && rm -f  "$seed"  && echo "    Deleted ${VM}-seed.iso"    || true
-    [[ -d "$cidir" ]] && rm -rf "$cidir" && echo "    Deleted cloud-init-${VM}/" || true
+    [[ -f "$disk" ]] && rm -f "$disk" && echo "    Deleted ${VM}.qcow2" || true
   done
 
   echo ""
@@ -142,8 +140,6 @@ for VM in "${VMS[@]}"; do
   RAM="${VM_RAM[$VM]}"
   DISK_GB="${VM_DISK[$VM]}"
   DISK_PATH="$IMAGES_DIR/${VM}.qcow2"
-  SEED_PATH="$IMAGES_DIR/${VM}-seed.iso"
-  CLOUD_INIT_DIR="$IMAGES_DIR/cloud-init-${VM}"
 
   echo ""
   echo "==> Setting up VM: $VM  (IP: $IP, RAM: ${RAM}MB, Disk: ${DISK_GB}GB)"
@@ -159,70 +155,15 @@ for VM in "${VMS[@]}"; do
     qemu-img create -f qcow2 -b "$BASE_IMAGE" -F qcow2 "$DISK_PATH" "${DISK_GB}G"
   fi
 
-  # Build cloud-init files
-  mkdir -p "$CLOUD_INIT_DIR"
-
-  cat > "$CLOUD_INIT_DIR/meta-data" <<EOF
-instance-id: ${VM}
-local-hostname: ${VM}
-EOF
-
-  # Netplan static IP config (Debian cloud image uses netplan or ifupdown)
-  # Debian 12 cloud image uses ifupdown, so we use network-config v1 format
-  cat > "$CLOUD_INIT_DIR/network-config" <<EOF
-version: 1
-config:
-  - type: physical
-    name: enp1s0
-    subnets:
-      - type: static
-        address: ${IP}/24
-        gateway: ${GATEWAY}
-        dns_nameservers:
-          - 8.8.8.8
-          - 1.1.1.1
-EOF
-
-  cat > "$CLOUD_INIT_DIR/user-data" <<EOF
-#cloud-config
-hostname: ${VM}
-fqdn: ${VM}.kubernetes.local
-
-# Allow root SSH with key (required by tutorial)
-disable_root: false
-ssh_pwauth: false
-
-users:
-  - name: root
-    ssh_authorized_keys:
-      - ${SSH_PUB_KEY}
-
-# Also inject key into default 'debian' user if needed
-  - name: debian
-    groups: sudo
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    ssh_authorized_keys:
-      - ${SSH_PUB_KEY}
-
-ssh_keys: {}
-
-# Enable root login via SSH
-write_files:
-  - path: /etc/ssh/sshd_config.d/99-k8s-hardway.conf
-    content: |
-      PermitRootLogin yes
-      PubkeyAuthentication yes
-
-runcmd:
-  - systemctl restart ssh
-EOF
-
-  # Create seed ISO
-  cloud-localds --network-config="$CLOUD_INIT_DIR/network-config" \
-    "$SEED_PATH" \
-    "$CLOUD_INIT_DIR/user-data" \
-    "$CLOUD_INIT_DIR/meta-data"
+  # Configure the disk image directly — no cloud-init required
+  virt-customize -a "$DISK_PATH" \
+    --hostname "$VM" \
+    --root-password "password:${VM_PASSWORD}" \
+    --ssh-inject "root:string:${SSH_PUB_KEY}" \
+    --run-command "printf 'PermitRootLogin yes\nPubkeyAuthentication yes\n' > /etc/ssh/sshd_config.d/99-k8s-hardway.conf" \
+    --run-command "ssh-keygen -A" \
+    --run-command "printf '[Match]\nName=enp1s0\n\n[Network]\nAddress=${IP}/24\nGateway=${GATEWAY}\nDNS=8.8.8.8\nDNS=1.1.1.1\n' > /etc/systemd/network/enp1s0.network" \
+    --run-command "echo '127.0.1.1 ${VM}.kubernetes.local ${VM}' >> /etc/hosts"
 
   # Launch VM
   virt-install \
@@ -230,7 +171,6 @@ EOF
     --memory "$RAM" \
     --vcpus 1 \
     --disk "path=$DISK_PATH,format=qcow2" \
-    --disk "path=$SEED_PATH,device=cdrom" \
     --os-variant debian12 \
     --network "network=$NETWORK_NAME,model=virtio" \
     --graphics none \
@@ -261,14 +201,20 @@ done
 
 if [[ $new_vms -gt 0 ]]; then
   echo ""
-  echo "==> Test SSH connectivity (may need a few more seconds):"
+  echo "==> Waiting for SSH connectivity (timeout: 60s per VM)..."
   for VM in "${VMS[@]}"; do
     IP="${VM_IP[$VM]}"
-    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
-         -i ~/.ssh/id_ed25519 root@"$IP" hostname 2>/dev/null; then
-      echo "    $VM ($IP): OK"
-    else
-      echo "    $VM ($IP): not ready yet — try: ssh root@$IP"
+    deadline=$((SECONDS + 60))
+    while [[ $SECONDS -lt $deadline ]]; do
+      if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o BatchMode=yes \
+           -i ~/.ssh/id_ed25519 root@"$IP" hostname &>/dev/null; then
+        echo "    $VM ($IP): OK"
+        break
+      fi
+      sleep 3
+    done
+    if [[ $SECONDS -ge $deadline ]]; then
+      echo "    $VM ($IP): timed out — try manually: ssh root@$IP"
     fi
   done
 fi
